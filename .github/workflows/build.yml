@@ -1,0 +1,137 @@
+name: Build SAWT AI Offline APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Android APK with offline Arabic voices
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Get repository files
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK 35
+        run: sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Extract and validate SAWT AI source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="$GITHUB_WORKSPACE/SAWT_AI_COMPLETE_SOURCE.zip"
+          if [[ ! -s "$ZIP" ]]; then
+            echo "ERROR: Upload SAWT_AI_COMPLETE_SOURCE.zip to the repository root." >&2
+            exit 1
+          fi
+          PROJECT_DIR="$RUNNER_TEMP/sawt-ai-source"
+          rm -rf "$PROJECT_DIR"
+          mkdir -p "$PROJECT_DIR"
+          unzip -q "$ZIP" -d "$PROJECT_DIR"
+          for file in \
+            settings.gradle.kts \
+            build.gradle.kts \
+            gradle.properties \
+            app/build.gradle.kts \
+            app/src/main/AndroidManifest.xml \
+            app/src/main/java/com/sawt/ai/MainActivity.kt \
+            scripts/prepare_models.sh \
+            scripts/smoke_test_models.py \
+            THIRD_PARTY_NOTICES.md; do
+            test -s "$PROJECT_DIR/$file" || { echo "Missing required file: $file" >&2; exit 1; }
+          done
+          bash -n "$PROJECT_DIR/scripts/prepare_models.sh"
+          python3 -m py_compile "$PROJECT_DIR/scripts/smoke_test_models.py"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Source archive extracted; required files and shell syntax verified."
+
+      - name: Download and validate offline runtime and voice models
+        shell: bash
+        run: bash "$PROJECT_DIR/scripts/prepare_models.sh" "$PROJECT_DIR"
+
+      - name: Set up Python 3.12 for model tests
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pinned Sherpa-ONNX CPU test runtime
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip
+          python -m pip install --disable-pip-version-check \
+            "sherpa-onnx==1.13.8" "sherpa-onnx-bin==1.13.8"
+
+      - name: Test real Arabic speech generation for both models
+        run: python "$PROJECT_DIR/scripts/smoke_test_models.py" "$PROJECT_DIR"
+
+      - name: Build debug APK
+        run: gradle -p "$PROJECT_DIR" --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Verify APK, signature, app ID, ABIs, and bundled offline models
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK"
+          CONTENTS="$RUNNER_TEMP/sawt-apk-contents.txt"
+          unzip -Z1 "$APK" > "$CONTENTS"
+
+          # Confirm that Android code and native runtime were packaged.
+          grep -Eq '^classes[0-9]*\.dex$' "$CONTENTS"
+          grep -Fq 'lib/arm64-v8a/libsherpa-onnx-jni.so' "$CONTENTS"
+          grep -Fq 'lib/armeabi-v7a/libsherpa-onnx-jni.so' "$CONTENTS"
+
+          # Confirm both offline Arabic TTS models and phoneme data are inside the APK.
+          for required in \
+            assets/models/kareem/ar_JO-kareem-medium.onnx \
+            assets/models/kareem/tokens.txt \
+            assets/models/nabra/model.int4.onnx \
+            assets/models/nabra/tokens.txt \
+            assets/models/nabra/voices.bin \
+            assets/models/espeak-ng-data/phondata \
+            assets/models/espeak-ng-data/phontab \
+            assets/models/espeak-ng-data/phonindex \
+            assets/THIRD_PARTY_NOTICES.txt; do
+            grep -Fqx "$required" "$CONTENTS" || { echo "APK is missing: $required" >&2; exit 1; }
+          done
+
+          AAPT="$ANDROID_HOME/build-tools/35.0.0/aapt"
+          APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          "$AAPT" dump badging "$APK" > "$RUNNER_TEMP/sawt-badging.txt"
+          grep -Fq "package: name='com.sawt.ai'" "$RUNNER_TEMP/sawt-badging.txt"
+          grep -Fq "sdkVersion:'23'" "$RUNNER_TEMP/sawt-badging.txt"
+          "$APKSIGNER" verify --verbose "$APK"
+
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          cp "$APK" "$GITHUB_WORKSPACE/artifacts/SAWT-AI.apk"
+          ls -lh "$GITHUB_WORKSPACE/artifacts/SAWT-AI.apk"
+          echo "APK build, package metadata, signature, ABIs, and bundled model files verified."
+
+      - name: Upload installable APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SAWT-AI-Offline-APK
+          path: artifacts/SAWT-AI.apk
+          if-no-files-found: error
+          retention-days: 14
